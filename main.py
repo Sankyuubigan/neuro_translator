@@ -3,71 +3,107 @@ import os
 import json
 import time
 import re
-import ctranslate2
-import sentencepiece as spm
-from huggingface_hub import snapshot_download
+import traceback
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout,
                                QWidget, QTextEdit, QPushButton, QLabel, QMessageBox, 
                                QProgressBar, QComboBox, QCheckBox, QGroupBox, QTabWidget, 
                                QLineEdit, QFileDialog)
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QObject, QMetaObject
 
-# === Файл настроек ===
+# =================================================================================
+# ГЛОБАЛЬНАЯ СИСТЕМА ЛОГОВ (БЕЗ ОЧЕРЕДЕЙ, НАПРЯМУЮ)
+# =================================================================================
+
+class LoggerSignals(QObject):
+    # Сигнал, который передает текст (str)
+    log_signal = Signal(str)
+
+# Создаем глобальный экземпляр сигналов ДО всего остального
+global_signals = LoggerSignals()
+
+class StreamRedirector:
+    """Класс, который заменяет sys.stdout и sys.stderr"""
+    def __init__(self, original_stream):
+        self.original_stream = original_stream
+
+    def write(self, text):
+        # 1. Пишем в черную консоль (чтобы ты видел, что процесс идет)
+        if self.original_stream:
+            try:
+                self.original_stream.write(text)
+                self.original_stream.flush()
+            except: pass
+        
+        # 2. Отправляем в GUI через сигнал
+        # Эмит сигнала потокобезопасен в Qt, он сам встанет в очередь событий
+        try:
+            if text:
+                global_signals.log_signal.emit(str(text))
+        except:
+            pass # Если приложение закрывается, может быть ошибка, игнорим
+
+    def flush(self):
+        if self.original_stream:
+            try: self.original_stream.flush()
+            except: pass
+
+# Сохраняем оригиналы
+ORIGINAL_STDOUT = sys.__stdout__
+ORIGINAL_STDERR = sys.__stderr__
+
+# ПОДМЕНЯЕМ ПОТОКИ ПРЯМО СЕЙЧАС
+# Теперь любой print() в программе вызовет global_signals.log_signal.emit()
+sys.stdout = StreamRedirector(ORIGINAL_STDOUT)
+sys.stderr = StreamRedirector(ORIGINAL_STDERR)
+
+print("--- СТАРТ СИСТЕМЫ ЛОГОВ ---")
+
+# =================================================================================
+
+try:
+    import ctranslate2
+    import sentencepiece as spm
+    from huggingface_hub import snapshot_download
+    print("Библиотеки загружены.")
+except ImportError as e:
+    print(f"CRITICAL ERROR: {e}")
+    sys.exit(1)
+
 CONFIG_FILE = "settings.json"
 DEFAULT_MODEL_REPO = "santhosh/madlad400-3b-ct2"
-
 LANGUAGES = {
     "Русский": "ru", "English": "en", "German": "de", "French": "fr",
     "Spanish": "es", "Ukrainian": "uk", "Italian": "it", "Chinese": "zh"
 }
-
-# === КЛАСС ДЛЯ РАБОТЫ С НАСТРОЙКАМИ ===
-class ConfigManager:
-    @staticmethod
-    def load():
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {"model_path": os.getcwd(), "default_lang": "English"}
-
-    @staticmethod
-    def save(data):
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4)
 
 # === ДВИЖОК ===
 class TranslatorEngine:
     def __init__(self):
         self.translator = None
         self.sp = None
-        self.loaded_path = None
 
     def load(self, model_path):
-        # Если уже загружено то же самое, не тратим время
-        if self.translator and self.loaded_path == model_path:
-            return True, "Модель уже загружена"
+        print(f"Загрузка движка из: {model_path}")
+        sp_path = os.path.join(model_path, "sentencepiece.model")
+        model_bin = os.path.join(model_path, "model.bin")
+        
+        if not os.path.exists(sp_path) or not os.path.exists(model_bin):
+            return False, "Файлы не найдены!"
 
         try:
-            sp_path = os.path.join(model_path, "sentencepiece.model")
-            model_bin = os.path.join(model_path, "model.bin")
-            
-            if not os.path.exists(sp_path) or not os.path.exists(model_bin):
-                return False, "Файлы модели не найдены"
-            
             self.sp = spm.SentencePieceProcessor()
             self.sp.load(sp_path)
-            self.translator = ctranslate2.Translator(model_path, device="cpu", intra_threads=0)
-            self.loaded_path = model_path
-            return True, "Модель успешно загружена"
+            # intra_threads=4 для стабильности
+            self.translator = ctranslate2.Translator(model_path, device="cpu", intra_threads=4)
+            print("CTranslate2 готов.")
+            return True, "Готово"
         except Exception as e:
+            print(f"Ошибка движка: {e}")
             return False, str(e)
 
     def translate(self, text, target_lang_code, beam_size=1):
-        if not self.translator: return "Ошибка: Модель не загружена"
+        if not self.translator: return "Ошибка: движок не готов"
         try:
             input_text = f"<2{target_lang_code}> {text}"
             source_tokens = self.sp.encode_as_pieces(input_text)
@@ -76,9 +112,22 @@ class TranslatorEngine:
             )
             return self.sp.decode(results[0].hypotheses[0])
         except Exception as e:
+            print(f"Ошибка перевода: {e}")
             return f"Error: {e}"
 
 engine = TranslatorEngine()
+
+class ConfigManager:
+    @staticmethod
+    def load():
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f: return json.load(f)
+            except: pass
+        return {"model_path": os.getcwd()}
+    @staticmethod
+    def save(data):
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
 
 # === ПОТОКИ ===
 class LoaderThread(QThread):
@@ -87,8 +136,12 @@ class LoaderThread(QThread):
         super().__init__()
         self.path = path
     def run(self):
-        success, msg = engine.load(self.path)
-        self.finished_signal.emit(success, msg)
+        try:
+            s, m = engine.load(self.path)
+            self.finished_signal.emit(s, m)
+        except Exception as e:
+            print(traceback.format_exc())
+            self.finished_signal.emit(False, str(e))
 
 class TranslateThread(QThread):
     result_signal = Signal(str, float)
@@ -96,292 +149,275 @@ class TranslateThread(QThread):
         super().__init__()
         self.text, self.code, self.beam = text, code, beam
     def run(self):
-        start = time.time()
-        res = engine.translate(self.text, self.code, self.beam)
-        self.result_signal.emit(res, time.time() - start)
+        t = time.time()
+        print(f"Start Translation -> {self.code}")
+        try:
+            res = engine.translate(self.text, self.code, self.beam)
+            self.result_signal.emit(res, time.time() - t)
+        except:
+            print(traceback.format_exc())
+            self.result_signal.emit("Error", 0)
 
 class DownloaderThread(QThread):
-    """Качает модель с HuggingFace"""
     finished_signal = Signal(bool, str)
-    
     def __init__(self, target_folder):
         super().__init__()
         self.target_folder = target_folder
-
     def run(self):
+        print("Начинаем скачивание...")
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         try:
-            snapshot_download(
-                repo_id=DEFAULT_MODEL_REPO,
-                local_dir=self.target_folder,
-                local_dir_use_symlinks=False,
-                resume_download=True
-            )
-            self.finished_signal.emit(True, "Скачивание завершено!")
+            snapshot_download(repo_id=DEFAULT_MODEL_REPO, local_dir=self.target_folder, local_dir_use_symlinks=False, resume_download=True, tqdm_class=None)
+            print("Скачивание завершено.")
+            self.finished_signal.emit(True, "OK")
         except Exception as e:
-            self.finished_signal.emit(False, f"Ошибка скачивания: {e}")
+            print(f"Ошибка скачивания: {e}")
+            self.finished_signal.emit(False, str(e))
 
 # === GUI ===
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AI Translator Pro (MADLAD-3B)")
-        self.resize(750, 600)
+        self.setWindowTitle("AI Translator Pro (Direct Signals)")
+        self.resize(850, 650)
         self.apply_styles()
         
-        # Загрузка конфига
         self.config = ConfigManager.load()
         
-        # Основной виджет - ТАБЫ
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
-
-        # Создаем вкладки
+        
         self.tab_translate = QWidget()
         self.tab_settings = QWidget()
+        self.tab_logs = QWidget()
         
         self.setup_translate_ui()
         self.setup_settings_ui()
+        self.setup_logs_ui()
         
-        self.tabs.addTab(self.tab_translate, "🌐 Переводчик")
-        self.tabs.addTab(self.tab_settings, "⚙️ Настройки и Модель")
+        self.tabs.addTab(self.tab_translate, "Перевод")
+        self.tabs.addTab(self.tab_settings, "Настройки")
+        self.tabs.addTab(self.tab_logs, "Логи")
 
-        # Пробуем загрузить модель при старте
+        # === ПОДКЛЮЧЕНИЕ СИГНАЛА К СЛОТУ ===
+        # Как только print() сработает где угодно, вызовется self.append_log
+        global_signals.log_signal.connect(self.append_log)
+        
+        print("GUI инициализирован. Связь установлена.")
+        
+        # Загрузка
         self.check_and_load_model()
 
     def apply_styles(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background-color: #2b2b2b; color: #fff; }
+            QMainWindow, QWidget { background-color: #2b2b2b; color: #ffffff; font-family: 'Segoe UI', sans-serif; }
             QTabWidget::pane { border: 1px solid #444; }
-            QTabBar::tab { background: #333; padding: 8px 20px; color: #aaa; }
-            QTabBar::tab:selected { background: #444; color: #fff; border-bottom: 2px solid #007ACC; }
-            QTextEdit, QLineEdit { background: #3b3b3b; border: 1px solid #555; padding: 5px; color: #fff; border-radius: 4px;}
-            QPushButton { background: #007ACC; padding: 8px; border-radius: 4px; font-weight: bold; }
+            QTabBar::tab { 
+                background: #3e3e3e; 
+                color: #b0b0b0; 
+                padding: 10px 20px; 
+            }
+            QTabBar::tab:selected { 
+                background: #505050; 
+                color: #ffffff; 
+                border-bottom: 3px solid #007ACC; 
+                font-weight: bold;
+            }
+            QTextEdit, QLineEdit { background: #3b3b3b; border: 1px solid #555; padding: 5px; color: #fff; }
+            QPushButton { background: #007ACC; padding: 8px; border-radius: 4px; font-weight: bold; border: none;}
             QPushButton:hover { background: #005A9E; }
             QPushButton:disabled { background: #444; color: #888; }
-            QComboBox { background: #3b3b3b; border: 1px solid #555; padding: 4px; color: white; }
-            QComboBox QAbstractItemView { background: #3b3b3b; color: white; selection-background-color: #007ACC; }
-            QLabel { font-size: 13px; }
-            QGroupBox { border: 1px solid #555; margin-top: 10px; padding-top: 10px; font-weight: bold; }
+            QComboBox { background: #3b3b3b; padding: 5px; color: white; border: 1px solid #555;}
+            QGroupBox { border: 1px solid #555; margin-top: 15px; padding-top: 15px; font-weight: bold; color: #ddd;}
+            QProgressBar { border: 1px solid #555; text-align: center; }
+            QProgressBar::chunk { background-color: #007ACC; }
         """)
 
-    # --- ВКЛАДКА 1: ПЕРЕВОД ---
     def setup_translate_ui(self):
-        layout = QVBoxLayout(self.tab_translate)
+        l = QVBoxLayout(self.tab_translate)
+        top = QHBoxLayout()
+        self.lang = QComboBox()
+        self.lang.addItems(LANGUAGES.keys())
+        top.addWidget(QLabel("Цель:"))
+        top.addWidget(self.lang)
+        self.auto = QCheckBox("Авто (RU/EN)")
+        self.auto.setChecked(True)
+        top.addWidget(self.auto)
+        top.addStretch()
+        self.speed = QComboBox()
+        self.speed.addItems(["Турбо (Beam 1)", "Баланс (Beam 2)", "Качество (Beam 4)"])
+        top.addWidget(QLabel("Режим:"))
+        top.addWidget(self.speed)
+        l.addLayout(top)
         
-        # Панель управления
-        top_layout = QHBoxLayout()
-        self.lang_combo = QComboBox()
-        self.lang_combo.addItems(LANGUAGES.keys())
-        top_layout.addWidget(QLabel("Цель:"))
-        top_layout.addWidget(self.lang_combo)
+        self.inp = QTextEdit()
+        self.inp.setPlaceholderText("Введите текст...")
+        self.inp.textChanged.connect(self.on_text_change)
+        l.addWidget(self.inp)
         
-        self.auto_switch = QCheckBox("Авто-язык")
-        self.auto_switch.setChecked(True)
-        top_layout.addWidget(self.auto_switch)
+        self.btn = QPushButton("ПЕРЕВЕСТИ")
+        self.btn.clicked.connect(self.start_tr)
+        self.btn.setFixedHeight(50)
+        self.btn.setStyleSheet("background-color: #2E7D32;")
+        l.addWidget(self.btn)
         
-        top_layout.addStretch()
-        
-        self.speed_combo = QComboBox()
-        self.speed_combo.addItems(["⚡ Турбо (Beam=1)", "⚖️ Баланс (Beam=2)", "🧠 Качество (Beam=4)"])
-        top_layout.addWidget(QLabel("Режим:"))
-        top_layout.addWidget(self.speed_combo)
-        layout.addLayout(top_layout)
+        self.out = QTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setStyleSheet("background-color: #222;")
+        l.addWidget(self.out)
+        self.stat = QLabel("...")
+        l.addWidget(self.stat)
 
-        # Ввод/Вывод
-        layout.addWidget(QLabel("Исходный текст:"))
-        self.input_text = QTextEdit()
-        self.input_text.textChanged.connect(self.on_text_changed)
-        layout.addWidget(self.input_text)
-        
-        self.btn_translate = QPushButton("ПЕРЕВЕСТИ")
-        self.btn_translate.clicked.connect(self.start_translate)
-        self.btn_translate.setFixedHeight(45)
-        layout.addLayout(self.create_btn_layout(self.btn_translate))
-        
-        layout.addWidget(QLabel("Результат:"))
-        self.output_text = QTextEdit()
-        self.output_text.setReadOnly(True)
-        self.output_text.setStyleSheet("background-color: #222;")
-        layout.addWidget(self.output_text)
-        
-        self.status_bar = QLabel("Ожидание...")
-        layout.addWidget(self.status_bar)
-
-    def create_btn_layout(self, btn):
-        l = QHBoxLayout()
-        l.addWidget(btn)
-        return l
-
-    # --- ВКЛАДКА 2: НАСТРОЙКИ ---
     def setup_settings_ui(self):
-        layout = QVBoxLayout(self.tab_settings)
-        layout.setSpacing(15)
+        l = QVBoxLayout(self.tab_settings)
+        gb = QGroupBox("Папка модели")
+        gl = QVBoxLayout()
+        hl = QHBoxLayout()
+        self.path_ed = QLineEdit(self.config.get("model_path", ""))
+        self.br_btn = QPushButton("...")
+        self.br_btn.setFixedWidth(40)
+        self.br_btn.clicked.connect(self.browse)
+        hl.addWidget(self.path_ed)
+        hl.addWidget(self.br_btn)
+        gl.addLayout(hl)
+        self.lbl_st = QLabel("Статус: ?")
+        gl.addWidget(self.lbl_st)
+        self.load_btn = QPushButton("Загрузить")
+        self.load_btn.clicked.connect(self.check_and_load_model)
+        gl.addWidget(self.load_btn)
+        gb.setLayout(gl)
+        l.addWidget(gb)
         
-        # Группа выбора пути
-        gb_path = QGroupBox("Путь к папке с моделью")
-        l_path = QVBoxLayout()
-        
-        path_controls = QHBoxLayout()
-        self.path_edit = QLineEdit(self.config.get("model_path", ""))
-        self.btn_browse = QPushButton("...")
-        self.btn_browse.setFixedWidth(40)
-        self.btn_browse.setStyleSheet("background: #555;")
-        self.btn_browse.clicked.connect(self.browse_folder)
-        
-        path_controls.addWidget(self.path_edit)
-        path_controls.addWidget(self.btn_browse)
-        l_path.addLayout(path_controls)
-        
-        # Индикатор статуса модели
-        self.lbl_model_status = QLabel("Статус неизвестен")
-        self.lbl_model_status.setStyleSheet("font-weight: bold; color: gray;")
-        l_path.addWidget(self.lbl_model_status)
-        
-        # Кнопка применить
-        self.btn_apply = QPushButton("Сохранить путь и Загрузить")
-        self.btn_apply.clicked.connect(self.check_and_load_model)
-        l_path.addWidget(self.btn_apply)
-        
-        gb_path.setLayout(l_path)
-        layout.addWidget(gb_path)
+        gb2 = QGroupBox("Интернет")
+        gl2 = QVBoxLayout()
+        gl2.addWidget(QLabel(f"Repo: {DEFAULT_MODEL_REPO}"))
+        self.dl_btn = QPushButton("СКАЧАТЬ МОДЕЛЬ")
+        self.dl_btn.setStyleSheet("background-color: #D32F2F;")
+        self.dl_btn.clicked.connect(self.dl_start)
+        gl2.addWidget(self.dl_btn)
+        self.prog = QProgressBar()
+        self.prog.hide()
+        gl2.addWidget(self.prog)
+        gb2.setLayout(gl2)
+        l.addWidget(gb2)
+        l.addStretch()
 
-        # Группа скачивания
-        gb_down = QGroupBox("Скачивание модели (Интернет)")
-        l_down = QVBoxLayout()
-        l_down.addWidget(QLabel(f"Если модели нет, нажмите скачать.\nБудет скачано ~2.9 Гб с {DEFAULT_MODEL_REPO}"))
+    def setup_logs_ui(self):
+        l = QVBoxLayout(self.tab_logs)
+        # ВАЖНО: Используем append для добавления текста, поэтому setReadOnly=True
+        self.logs = QTextEdit()
+        self.logs.setReadOnly(True)
+        # Ярко-зеленый на черном
+        self.logs.setStyleSheet("background-color: #000000; color: #00FF00; font-family: Consolas, monospace; font-size: 13px; border: 1px solid #555;")
+        l.addWidget(self.logs)
         
-        self.btn_download = QPushButton("СКАЧАТЬ МОДЕЛЬ")
-        self.btn_download.setStyleSheet("background-color: #D32F2F;")
-        self.btn_download.clicked.connect(self.start_download)
-        l_down.addWidget(self.btn_download)
-        
-        self.progress_down = QProgressBar()
-        self.progress_down.setTextVisible(False)
-        self.progress_down.hide()
-        l_down.addWidget(self.progress_down)
-        
-        gb_down.setLayout(l_down)
-        layout.addWidget(gb_down)
-        
-        layout.addStretch()
+        h = QHBoxLayout()
+        clr = QPushButton("Очистить")
+        clr.clicked.connect(self.logs.clear)
+        h.addWidget(clr)
+        tst = QPushButton("ТЕСТ ЛОГА (ЖМИ)")
+        tst.clicked.connect(lambda: print("Тестовый лог работает!"))
+        h.addWidget(tst)
+        l.addLayout(h)
 
-    # --- ЛОГИКА ---
-    def browse_folder(self):
-        d = QFileDialog.getExistingDirectory(self, "Выбрать папку модели", self.path_edit.text())
-        if d:
-            self.path_edit.setText(d)
+    # === ГЛАВНЫЙ СЛОТ ДЛЯ ЛОГОВ ===
+    @Slot(str)
+    def append_log(self, text):
+        # Если пришла пустая строка - игнорим
+        if not text: return
+        try:
+            # Убираем лишние переносы, чтобы не было пустых строк
+            text = text.rstrip()
+            if text:
+                self.logs.append(text) 
+                # Прокрутка вниз
+                self.logs.verticalScrollBar().setValue(self.logs.verticalScrollBar().maximum())
+        except: pass
+
+    def browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Выбор папки", self.path_ed.text())
+        if d: self.path_ed.setText(d)
 
     def check_and_load_model(self):
-        path = self.path_edit.text().strip()
-        if not path:
-            self.set_model_status(False, "Путь не указан")
-            return
-
-        # Сохраняем в конфиг
-        self.config["model_path"] = path
+        p = self.path_ed.text().strip()
+        if not p: return
+        self.config["model_path"] = p
         ConfigManager.save(self.config)
-        
-        # Блокируем интерфейс
-        self.btn_translate.setEnabled(False)
-        self.btn_translate.setText("Загрузка...")
-        self.status_bar.setText("Инициализация движка...")
-        
-        # Запускаем поток загрузки
-        self.loader = LoaderThread(path)
-        self.loader.finished_signal.connect(self.on_model_loaded)
+        self.btn.setEnabled(False)
+        self.load_btn.setEnabled(False)
+        self.stat.setText("Загрузка...")
+        self.loader = LoaderThread(p)
+        self.loader.finished_signal.connect(self.on_load_done)
+        self.loader.daemon = True
         self.loader.start()
 
     @Slot(bool, str)
-    def on_model_loaded(self, success, msg):
-        self.set_model_status(success, msg)
-        if success:
-            self.btn_translate.setEnabled(True)
-            self.btn_translate.setText("ПЕРЕВЕСТИ")
-            self.status_bar.setText("Готов к работе")
+    def on_load_done(self, s, m):
+        self.load_btn.setEnabled(True)
+        self.lbl_st.setText(m)
+        self.lbl_st.setStyleSheet(f"color: {'#0F0' if s else '#F00'}; font-weight: bold;")
+        print(f"Результат загрузки: {m}")
+        if s:
+            self.btn.setEnabled(True)
+            self.stat.setText("Готов")
         else:
-            self.btn_translate.setText("Модель не готова")
+            self.btn.setText("Ошибка")
+            QMessageBox.warning(self, "Ошибка", m)
 
-    def set_model_status(self, success, text):
-        self.lbl_model_status.setText(text)
-        color = "#4CAF50" if success else "#F44336" # Green / Red
-        self.lbl_model_status.setStyleSheet(f"font-weight: bold; color: {color};")
-
-    def start_download(self):
-        path = self.path_edit.text().strip()
-        if not path:
-            QMessageBox.warning(self, "Ошибка", "Выберите папку, куда качать!")
+    def dl_start(self):
+        p = self.path_ed.text().strip()
+        if not p or not os.path.exists(p): 
+            QMessageBox.warning(self, "Путь", "Папка не существует")
             return
-            
-        if not os.path.exists(path):
-            try:
-                os.makedirs(path)
-            except:
-                QMessageBox.warning(self, "Ошибка", "Не могу создать папку!")
-                return
-
-        reply = QMessageBox.question(self, "Скачивание", f"Начать скачивание в:\n{path}?\nЭто займет время.", QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.No: return
-
-        self.btn_download.setEnabled(False)
-        self.progress_down.setRange(0, 0) # Бесконечный прогресс
-        self.progress_down.show()
-        self.lbl_model_status.setText("Идет скачивание... Не закрывайте программу!")
-        
-        self.downloader = DownloaderThread(path)
-        self.downloader.finished_signal.connect(self.on_download_finished)
-        self.downloader.start()
+        self.dl_btn.setEnabled(False)
+        self.prog.setRange(0,0)
+        self.prog.show()
+        self.tabs.setCurrentWidget(self.tab_logs)
+        self.dl = DownloaderThread(p)
+        self.dl.finished_signal.connect(self.on_dl_done)
+        self.dl.daemon = True
+        self.dl.start()
 
     @Slot(bool, str)
-    def on_download_finished(self, success, msg):
-        self.progress_down.hide()
-        self.btn_download.setEnabled(True)
-        QMessageBox.information(self, "Статус", msg)
-        if success:
+    def on_dl_done(self, s, m):
+        self.prog.hide()
+        self.dl_btn.setEnabled(True)
+        if s: 
+            QMessageBox.information(self, "OK", "Скачано!")
             self.check_and_load_model()
+        else: 
+            QMessageBox.critical(self, "Err", m)
 
-    def on_text_changed(self):
-        if not self.auto_switch.isChecked(): return
-        text = self.input_text.toPlainText()
-        if not text: return
-        has_ru = bool(re.search('[а-яА-Я]', text))
-        curr = self.lang_combo.currentText()
-        if has_ru and curr != "English": self.lang_combo.setCurrentText("English")
-        elif not has_ru and curr != "Русский" and curr == "English": self.lang_combo.setCurrentText("Русский")
+    def on_text_change(self):
+        if not self.auto.isChecked(): return
+        t = self.inp.toPlainText()
+        if not t: return
+        has_ru = bool(re.search('[а-яА-Я]', t))
+        curr = self.lang.currentText()
+        if has_ru and curr != "English": self.lang.setCurrentText("English")
+        elif not has_ru and curr != "Русский" and curr == "English": self.lang.setCurrentText("Русский")
 
-    def start_translate(self):
-        text = self.input_text.toPlainText().strip()
-        if not text: return
-        
-        beam = [1, 2, 4][self.speed_combo.currentIndex()]
-        target = LANGUAGES[self.lang_combo.currentText()]
-        
-        self.btn_translate.setEnabled(False)
-        self.status_bar.setText("Перевод...")
-        
-        self.worker = TranslateThread(text, target, beam)
-        self.worker.result_signal.connect(self.on_result)
+    def start_tr(self):
+        t = self.inp.toPlainText().strip()
+        if not t: return
+        bm = [1, 2, 4][self.speed.currentIndex()]
+        tg = LANGUAGES[self.lang.currentText()]
+        self.btn.setEnabled(False)
+        self.stat.setText("Думаю...")
+        self.worker = TranslateThread(t, tg, bm)
+        self.worker.result_signal.connect(self.on_tr_done)
+        self.worker.daemon = True
         self.worker.start()
 
     @Slot(str, float)
-    def on_result(self, text, t):
-        self.output_text.setPlainText(text)
-        self.btn_translate.setEnabled(True)
-        self.status_bar.setText(f"Готово за {t:.2f} сек")
-        def closeEvent(self, event):
-        # Если потоки еще работают — убиваем их перед выходом, чтобы не было ошибки
-        if hasattr(self, 'loader') and self.loader.isRunning():
-            self.loader.terminate()
-            self.loader.wait()
-        
-        if hasattr(self, 'worker') and self.worker.isRunning():
-            self.worker.terminate()
-            self.worker.wait()
-            
-        if hasattr(self, 'downloader') and self.downloader.isRunning():
-            self.downloader.terminate()
-            self.downloader.wait()
-            
-        event.accept()
+    def on_tr_done(self, txt, tm):
+        self.out.setPlainText(txt)
+        self.btn.setEnabled(True)
+        self.stat.setText(f"{tm:.2f} сек")
+        print(f"Готово: {tm:.2f}s")
+
+    def closeEvent(self, e):
+        os._exit(0)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

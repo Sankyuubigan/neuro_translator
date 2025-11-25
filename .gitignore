@@ -1,2 +1,4 @@
 /env
 /dist
+/build
+/debug.log
