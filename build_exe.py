@@ -3,60 +3,96 @@ import os
 import shutil
 import time
 import subprocess
+import sys
 
-# Имя твоего скрипта и exe
+# Попытка импорта Pillow для конвертации
+try:
+    from PIL import Image
+except ImportError:
+    print("❌ ОШИБКА: Не установлена библиотека Pillow.")
+    print("👉 Запусти: pip install Pillow")
+    sys.exit(1)
+
 SCRIPT_NAME = "main.py"
 EXE_NAME = "NeuralTranslator"
+PNG_ICON = "logo.png"
+ICO_ICON = "logo.ico"
 
 def kill_process():
-    """Убивает процесс, если он завис в памяти"""
-    print(f"🔪 Проверяем, не запущен ли {EXE_NAME}.exe...")
+    print(f"🔪 Проверяем процессы {EXE_NAME}...")
     try:
-        # Команда Windows для убийства процесса
         subprocess.run(f"taskkill /F /IM {EXE_NAME}.exe", shell=True, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        time.sleep(1) # Даем винде время освободить файл
-    except Exception:
-        pass
+        time.sleep(1) 
+    except: pass
 
 def clean_dist():
-    """Удаляет старую папку dist, чтобы собрать начисто"""
-    dist_path = "dist"
-    if os.path.exists(dist_path):
+    if os.path.exists("dist"):
+        try: shutil.rmtree("dist")
+        except: pass
+    if os.path.exists("build"):
+        try: shutil.rmtree("build")
+        except: pass
+
+def prepare_icon():
+    """Автоматически создает .ico из .png, если .ico нет"""
+    abs_png = os.path.abspath(PNG_ICON)
+    abs_ico = os.path.abspath(ICO_ICON)
+
+    if not os.path.exists(abs_png):
+        print(f"⚠️ ВНИМАНИЕ: Файл {PNG_ICON} не найден! Иконки не будет.")
+        return None
+
+    # Если ico уже есть - используем его, если нет - создаем из png
+    if not os.path.exists(abs_ico):
+        print(f"🔄 Конвертирую {PNG_ICON} в {ICO_ICON} для Windows...")
         try:
-            shutil.rmtree(dist_path)
-            print("🧹 Старая папка dist удалена.")
-        except PermissionError:
-            print("❌ ОШИБКА: Не могу удалить старый exe. Закрой программу вручную!")
-            return False
-    return True
+            img = Image.open(abs_png)
+            # Сохраняем как ICO с разными размерами для лучшего качества
+            img.save(abs_ico, format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
+            print("✅ Конвертация успешна.")
+        except Exception as e:
+            print(f"❌ Ошибка конвертации иконки: {e}")
+            return None
+    
+    return abs_ico
 
 def build():
     kill_process()
-    
-    if not clean_dist():
-        return
+    clean_dist()
 
-    print("🚀 Начинаем сборку EXE...")
+    print(f"🚀 Начинаем сборку...")
+    
+    # 1. Готовим иконку (PNG -> ICO)
+    icon_path = prepare_icon()
     
     args = [
         SCRIPT_NAME,
         f'--name={EXE_NAME}',
         '--noconfirm',
         '--onefile', 
-        '--windowed', # Оконный режим
+        '--windowed',
         '--hidden-import=ctranslate2',
         '--hidden-import=sentencepiece',
         '--hidden-import=huggingface_hub',
         '--clean',
-        '--icon=NONE' # Если есть иконка, укажи путь (например --icon=app.ico)
     ]
-    
+
+    # Добавляем иконку EXE (если создалась)
+    if icon_path:
+        args.append(f'--icon={icon_path}')
+        # Также добавляем сам PNG внутрь программы для GUI
+        args.append(f'--add-data={os.path.abspath(PNG_ICON)};.')
+
     try:
         PyInstaller.__main__.run(args)
-        print("\n✅ Сборка успешно завершена!")
-        print(f"📁 Файл лежит тут: {os.path.abspath('dist')}\\{EXE_NAME}.exe")
+        print("\n✅ Сборка готова!")
+        print(f"📁 EXE файл: {os.path.abspath('dist')}\\{EXE_NAME}.exe")
+        
+        # Удаляем временный ico файл, если хотим (сейчас оставил, чтобы не пересоздавать каждый раз)
+        # if os.path.exists(ICO_ICON): os.remove(ICO_ICON)
+        
     except Exception as e:
-        print(f"\n❌ Ошибка сборки: {e}")
+        print(f"\n❌ Ошибка PyInstaller: {e}")
 
 if __name__ == "__main__":
     build()

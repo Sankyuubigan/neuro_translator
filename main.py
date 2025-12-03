@@ -32,6 +32,17 @@ def log_debug(msg):
     print(msg) 
     logging.debug(msg)
 
+# Функция для поиска ресурсов внутри EXE (для иконки)
+def resource_path(relative_path):
+    """ Получает абсолютный путь к ресурсу, работает для dev и для PyInstaller """
+    try:
+        # PyInstaller создает временную папку в _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 myappid = 'neural.translator.pro.v1'
 try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
@@ -66,7 +77,6 @@ class VARIANT(ctypes.Structure):
                 ("_u", _U)]
 
 # --- IAccessible Interface Definition ---
-# Нам нужен только get_accState, но vtable требует правильного порядка методов
 COMMETHOD = ctypes.WINFUNCTYPE
 
 class IAccessibleVtbl(ctypes.Structure):
@@ -164,7 +174,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("AI Translator Pro")
         self.resize(850, 650)
         
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+        # Используем resource_path для загрузки иконки
+        icon_path = resource_path("logo.png")
         if os.path.exists(icon_path):
             self.app_icon = QIcon(icon_path)
             self.setWindowIcon(self.app_icon)
@@ -388,9 +399,6 @@ class MainWindow(QMainWindow):
         return buff.value
 
     def has_text_caret(self):
-        """
-        Проверка поля ввода с учетом "невидимых" курсоров в браузерах.
-        """
         try:
             foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
             if not foreground_hwnd: return False
@@ -399,7 +407,7 @@ class MainWindow(QMainWindow):
             fg_class = self.get_window_class(foreground_hwnd)
             log_debug(f"DEBUG: Active Window: '{fg_title}' | Class: '{fg_class}'")
 
-            # --- СПОСОБ 1: Стандартный WinAPI (Notepad, etc) ---
+            # --- СПОСОБ 1: Стандартный WinAPI ---
             foreground_thread_id = ctypes.windll.user32.GetWindowThreadProcessId(foreground_hwnd, None)
             current_thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
 
@@ -427,7 +435,7 @@ class MainWindow(QMainWindow):
                 if attached:
                     ctypes.windll.user32.AttachThreadInput(current_thread_id, foreground_thread_id, False)
 
-            # --- СПОСОБ 2: MSAA с проверкой STATE (Браузеры) ---
+            # --- СПОСОБ 2: MSAA с проверкой STATE ---
             ptr = ctypes.POINTER(IAccessible)()
             res = ctypes.windll.oleacc.AccessibleObjectFromWindow(
                 foreground_hwnd, 
@@ -437,21 +445,17 @@ class MainWindow(QMainWindow):
             )
             
             if res == S_OK and ptr:
-                # Объект курсора есть, но нужно проверить, ВИДИМ ЛИ ОН
                 varChild = VARIANT()
                 varChild.vt = VT_I4
                 varChild._u.lVal = CHILDID_SELF
                 
                 varState = VARIANT()
-                
-                # Вызываем get_accState (индекс 14 в VTable)
                 hr = ptr.contents.lpVtbl.contents.get_accState(ptr, varChild, ctypes.byref(varState))
                 
                 if hr == S_OK and varState.vt == VT_I4:
                     state = varState._u.lVal
                     log_debug(f"DEBUG: MSAA Caret State: {state} (Hex: {hex(state)})")
                     
-                    # Проверяем флаг STATE_SYSTEM_INVISIBLE (0x8000)
                     if state & STATE_SYSTEM_INVISIBLE:
                         log_debug("DEBUG: Caret exists but is INVISIBLE -> Not an input field.")
                         return False
@@ -459,7 +463,6 @@ class MainWindow(QMainWindow):
                         log_debug("DEBUG: Caret exists and is VISIBLE -> Input field detected.")
                         return True
                 
-                # Освобождаем объект
                 ptr.contents.lpVtbl.contents.Release(ptr)
             else:
                 log_debug(f"DEBUG: MSAA Caret check failed or no object.")
@@ -560,6 +563,7 @@ class MainWindow(QMainWindow):
         self.lbl_st.setStyleSheet(f"color: {'#0F0' if s else '#F00'}; font-weight: bold;")
         if s:
             self.btn.setEnabled(True)
+            self.btn.setText("ПЕРЕВЕСТИ ТЕКСТ") # ИСПРАВЛЕНИЕ 1: Сброс текста кнопки
             self.stat.setText("Модель готова")
         else:
             self.btn.setText("Ошибка загрузки")

@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('D:\\Projects\\translator\\logo.png', '.')],
     hiddenimports=['ctranslate2', 'sentencepiece', 'huggingface_hub'],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='NONE',
+    icon=['D:\\Projects\\translator\\logo.ico'],
 )

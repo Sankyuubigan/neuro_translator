@@ -3,3 +3,4 @@ sentencepiece
 global-hotkeys
 keyboard
 pyperclip
+Pillow
