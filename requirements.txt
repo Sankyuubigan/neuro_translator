@@ -1,3 +1,5 @@
 ctranslate2
 sentencepiece
-time
+global-hotkeys
+keyboard
+pyperclip
